@@ -31,8 +31,6 @@ def register_routes(mcp):
             # §10.6 — declare only the categories this MCP implements.
             "external_connections": {
                 "api_key": {"name": "service_api_key"},
-                "oauth": None,
-                "project": None,
             },
         })
 
