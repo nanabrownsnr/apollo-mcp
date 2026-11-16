@@ -1,47 +1,93 @@
-"""Apollo MCP server entry point."""
+"""Apollo MCP server entry point.
 
-from app.config import settings
-from app.tools.apollo import register_apollo_tools
+Twynity API-key MCP pattern (POST /api/v1/keys per-user encrypted)
+"""
+
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from logging import getLogger
+
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.middleware import Middleware as MCPMiddleware
+from fastmcp.server.middleware import MiddlewareContext
+from pymongo import AsyncMongoClient
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
-# Create FastMCP server
+from app.auth import get_auth_provider
+from app.config import settings
+from app.connection_store import ApiKeyStore, set_active_store
+from app.tools.apollo import register_apollo_tools
+from app.twynity import register_routes
+
+logger = getLogger(__name__)
+
+
+@asynccontextmanager
+async def app_lifespan(server):
+    mongo = AsyncMongoClient(settings.MONGODB_URI, tz_aware=True)
+    task = None
+    try:
+        store = ApiKeyStore(
+            mongo[settings.DATABASE_NAME]["api_keys"], settings.ENCRYPTION_KEY
+        )
+        await store.setup()
+        set_active_store(store)
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        set_active_store(None)
+        await mongo.close()
+
+
 mcp = FastMCP(
-    title="Apollo.io - B2B Prospecting & Enrichment",
-    description="Single API key setup for Apollo.io. Provides company/people search and lead enrichment.",
-    version="0.1.0",
+    settings.APP_TITLE,
+    auth=get_auth_provider(),
+    lifespan=app_lifespan,
 )
 
-# Register Apollo tools
-register_apollo_tools(mcp)
 
-# Optional: Health check
-@mcp.tool(name="apollo_health")
-async def apollo_health() -> dict:
-    """Check Apollo API key validity."""
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-KEY": settings.APOLLO_API_KEY,
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                "https://api.apollo.io/v1/people",
-                headers=headers,
-                params={"limit": 1},
+class UsageTrackingMiddleware(MCPMiddleware):
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        try:
+            headers = get_http_headers()
+            await save_usage_report(
+                method="TOOL_CALL",
+                endpoint=context.message.name,
+                auth_header=headers.get("authorization"),
             )
-            if response.status_code == 200:
-                return {"status": "ok", "api_key_valid": True}
-            else:
-                return {"status": "error", "api_key_valid": False, "error": response.text}
-    except Exception as e:
-        return {"status": "error", "api_key_valid": False, "error": str(e)}
+        except Exception:
+            logger.exception("Usage tracking failed — continuing with tool call anyway")
 
+        return await call_next(context)
+
+
+# Note: Usage tracking disabled for now (Apollo MCP doesn't use it)
+# mcp.add_middleware(UsageTrackingMiddleware())
+
+register_apollo_tools(mcp)
+register_routes(mcp)
+
+
+origins = [origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id"],
+    )
+]
+
+
+app = mcp.http_app(middleware=middleware)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)

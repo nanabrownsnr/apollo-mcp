@@ -3,7 +3,22 @@
 import httpx
 from starlette.exceptions import HTTPException
 
-from app.config import settings
+from app.auth import get_identity_from_context
+from app.connection_store import get_active_store
+
+
+async def get_api_key() -> str:
+    """Get the Apollo API key from Twynity store."""
+    identity = await get_identity_from_context()
+    store = get_active_store()
+    if store is None:
+        raise HTTPException(status_code=503, detail="API key storage is not available")
+
+    token = await store.get(identity.user_id, identity.persona_id)
+    if not token or not token.get("key"):
+        raise HTTPException(status_code=401, detail="Apollo API key not configured")
+
+    return token["key"]
 
 
 async def search_organizations(
@@ -25,9 +40,10 @@ async def search_organizations(
     Returns:
         dict: Search results with organizations and people
     """
+    api_key = await get_api_key()
     headers = {
         "Content-Type": "application/json",
-        "X-API-KEY": settings.APOLLO_API_KEY,
+        "X-API-KEY": api_key,
     }
 
     # Build organizations search
@@ -43,10 +59,10 @@ async def search_organizations(
     if industries:
         org_params["industry"] = ",".join(industries)
 
-    async with httpx.AsyncClient(timeout=settings.TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         # Search organizations
         org_response = await client.get(
-            f"{settings.APOLLO_BASE_URL}/organizations",
+            "https://api.apollo.io/v1/organizations",
             headers=headers,
             params=org_params,
         )
@@ -94,9 +110,10 @@ async def search_people(
     Returns:
         dict: People search results
     """
+    api_key = await get_api_key()
     headers = {
         "Content-Type": "application/json",
-        "X-API-KEY": settings.APOLLO_API_KEY,
+        "X-API-KEY": api_key,
     }
 
     params = {
@@ -111,9 +128,9 @@ async def search_people(
     if country:
         params["country"] = country
 
-    async with httpx.AsyncClient(timeout=settings.TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
-            f"{settings.APOLLO_BASE_URL}/people",
+            "https://api.apollo.io/v1/people",
             headers=headers,
             params=params,
         )
@@ -133,14 +150,16 @@ async def enrich_person(person_id: str) -> dict:
     Returns:
         dict: Enriched person data including verified email
     """
+    api_key = await get_api_key()
     headers = {
         "Content-Type": "application/json",
-        "X-API-KEY": settings.APOLLO_API_KEY,
+        "X-API-KEY": api_key,
     }
 
-    async with httpx.AsyncClient(timeout=settings.TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
-            f"{settings.APOLLO_BASE_URL}/people/{person_id}",
+            "https://api.apollo.io/v1/people",
+            params={"id": person_id},
             headers=headers,
         )
         response.raise_for_status()
